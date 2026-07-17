@@ -210,7 +210,7 @@ export interface IVoiceClientService {
 	disconnect(): void;
 
 	// --- Outbound messages ---
-	sendPttStart(turnId: string): void;
+	sendPttStart(turnId: string, passive?: boolean): void;
 	sendPttAudioChunk(audio: string): void;
 	sendPttEnd(): void;
 	/**
