@@ -1526,7 +1526,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 			this._handleNarrationAck(e);
 		}));
 		this._voiceEventDisposables.add(this.voiceClientService.onNarrationUnblocked(e => {
-			this._retryDeferredNarration(this._sessionKey(e.codingSessionId));
+			this._retryDeferredNarration(this._sessionKey(e.codingSessionId), e.narrationId || undefined);
 		}));
 		this._voiceEventDisposables.add(this.voiceClientService.onNarrationInterrupted(e => {
 			this._handleNarrationInterrupted(e);
@@ -3594,13 +3594,17 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	}
 
 	/**
-	 * Revalidates a deferred narration for an unblock or reconnect, reusing only a busy retry's ID when its text is unchanged.
+	 * Revalidates a deferred narration for an unblock or reconnect, reusing only a busy retry's ID when its text is unchanged and ignoring stale unblock IDs.
 	 * Returns whether a retry was sent so reconnect can avoid entering auto-listen before playback.
 	 */
-	private _retryDeferredNarration(sessionKey: string): boolean {
+	private _retryDeferredNarration(sessionKey: string, unblockedNarrationId?: string): boolean {
 		const deferred = this._deferredNarrations.get(sessionKey);
 		if (!deferred) {
 			this.logService.trace(`[voice] narration_unblocked for ${sessionKey.slice(-32)} but nothing deferred; nothing to retry`);
+			return false;
+		}
+		if (unblockedNarrationId && deferred.narrationId !== unblockedNarrationId) {
+			this.logService.trace(`[voice] narration_unblocked id=${unblockedNarrationId.slice(0, 8)} for ${sessionKey.slice(-32)} does not match currently deferred id=${deferred.narrationId.slice(0, 8)}; a newer entry superseded it, skipping`);
 			return false;
 		}
 		let resource: URI | undefined;
