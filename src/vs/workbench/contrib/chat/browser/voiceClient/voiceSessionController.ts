@@ -590,8 +590,11 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	 * latest-wins (at most one pending per session). Retry is driven by the
 	 * `narration_unblocked` nudge, which the server sends only once the playback
 	 * guard clears — safe in push-to-talk and hands-free, never interrupting a
-	 * live press. See `_retryDeferredNarration` for the revalidation on retry.
-	 * Cleared on a new turn (`thinking`) or teardown.
+	 * live press. Also replayed on `session_init`/`session_resumed` (a dropped
+	 * socket loses any in-flight `narration_unblocked` nudge, so these would
+	 * otherwise never retry after a reconnect). See `_retryDeferredNarration`
+	 * for the revalidation on retry. Cleared on a new turn (`thinking`) or
+	 * teardown.
 	 */
 	private readonly _deferredNarrations = new Map<string, { narrationId: string; kind: 'response' | 'confirmation'; text: string; reuseNarrationId: boolean }>();
 
@@ -1479,7 +1482,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		// point at which the mic/handshake is settled and a turn will stick,
 		// so enter hands-free listening here (armed in the connect handler).
 		this._voiceEventDisposables.add(this.voiceClientService.onSessionInit(() => {
-			this.logService.trace(`[voice] session_init received; armListen=${this._enterListenOnSessionInit} pendingRetries=${this._pendingNarrationRetries.size}`);
+			this.logService.trace(`[voice] session_init received; armListen=${this._enterListenOnSessionInit} pendingRetries=${this._pendingNarrationRetries.size} deferredNarrations=${this._deferredNarrations.size}`);
 			// Replay any narration that was dropped because the socket was closed
 			// (see _narrate). Do this BEFORE entering listening: a real pending
 			// narration should play now (its playback drives re-listen) rather
@@ -1492,6 +1495,20 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 				this._pendingNarrationRetries.clear();
 				for (const [sessionId, item] of retries) {
 					narrated = this._narrate(sessionId, item.kind, item.text) || narrated;
+				}
+			}
+			// Also replay any narration that was deferred (busy/interrupted,
+			// awaiting a `narration_unblocked` nudge) across the disconnect - the
+			// nudge itself was lost with the dropped socket, so nothing would
+			// otherwise retry these. Reuses the same revalidation as the
+			// `narration_unblocked` path: only re-requests still-warranted items
+			// (re-checked against `_currentNarratable`) and reuses the same
+			// `narration_id` when the text is unchanged, so backend idempotency
+			// returns `accepted` without re-synth for anything already spoken.
+			if (this._deferredNarrations.size > 0) {
+				const deferredKeys = [...this._deferredNarrations.keys()];
+				for (const sessionKey of deferredKeys) {
+					narrated = this._retryDeferredNarration(sessionKey) || narrated;
 				}
 			}
 			if (this._enterListenOnSessionInit && !narrated) {
@@ -3577,18 +3594,14 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	}
 
 	/**
-	 * The `narration_unblocked` nudge fired for a deferred narration. Revalidate
-	 * against the current session state and only re-request if it is still
-	 * warranted, reusing the same id for a busy retry when the text is unchanged
-	 * (so the backend dedups a lost ack), but minting a fresh id after an
-	 * interruption because the old id is tombstoned for late-audio suppression.
-	 * If it is no longer warranted (resolved, or a different kind), drop it.
+	 * Revalidates a deferred narration for an unblock or reconnect, reusing only a busy retry's ID when its text is unchanged.
+	 * Returns whether a retry was sent so reconnect can avoid entering auto-listen before playback.
 	 */
-	private _retryDeferredNarration(sessionKey: string): void {
+	private _retryDeferredNarration(sessionKey: string): boolean {
 		const deferred = this._deferredNarrations.get(sessionKey);
 		if (!deferred) {
 			this.logService.trace(`[voice] narration_unblocked for ${sessionKey.slice(-32)} but nothing deferred; nothing to retry`);
-			return;
+			return false;
 		}
 		let resource: URI | undefined;
 		try {
@@ -3600,7 +3613,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		if (!narratable || narratable.kind !== deferred.kind) {
 			this.logService.trace(`[voice] deferred narration for ${sessionKey.slice(-32)} no longer warranted; dropping`);
 			this._clearDeferred(sessionKey);
-			return;
+			return false;
 		}
 		// The session may no longer be the one shown (the user switched away while
 		// the backend was busy). Speaking now would play this session's item over
@@ -3610,12 +3623,12 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		if (this._shouldDeferForSession(sessionKey)) {
 			this.logService.trace(`[voice] deferred narration for ${sessionKey.slice(-32)} no longer shown; dropping`);
 			this._clearDeferred(sessionKey);
-			return;
+			return false;
 		}
 		const reuseId = deferred.reuseNarrationId && narratable.text === deferred.text ? deferred.narrationId : undefined;
 		this.logService.trace(`[voice] retrying deferred narration for ${sessionKey.slice(-32)} reuse=${!!reuseId}`);
 		this._clearDeferred(sessionKey);
-		this._narrate(sessionKey, narratable.kind, narratable.text, reuseId);
+		return this._narrate(sessionKey, narratable.kind, narratable.text, reuseId);
 	}
 
 	/** Drop a deferred narration. */
