@@ -6,6 +6,8 @@
 import assert from 'assert';
 import sinon from 'sinon';
 import { mainWindow } from '../../../../../../base/browser/window.js';
+import { DeferredPromise } from '../../../../../../base/common/async.js';
+import { CancellationError } from '../../../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { observableValue } from '../../../../../../base/common/observable.js';
 import { URI } from '../../../../../../base/common/uri.js';
@@ -39,6 +41,7 @@ import { MockChatService } from '../../common/chatService/mockChatService.js';
 
 class TestVoiceClientService extends mock<IVoiceClientService>() {
 	private narrationCounter = 0;
+	disconnectCalls = 0;
 	readonly requests: { sessionId: string; kind: 'response' | 'confirmation'; text: string; narrationId: string }[] = [];
 	private readonly audioResponseEmitter = new Emitter<IVoiceAudioResponse>();
 	override readonly onAudioResponse = this.audioResponseEmitter.event;
@@ -61,7 +64,7 @@ class TestVoiceClientService extends mock<IVoiceClientService>() {
 	override readonly onFatalDisconnect = Event.None;
 	override readonly onTurnAutoEnded = Event.None;
 
-	override disconnect(): void { }
+	override disconnect(): void { this.disconnectCalls++; }
 	override async connect(): Promise<void> { }
 	override sendSessionContext(): void { }
 	override flushSessionContext(): void { }
@@ -72,10 +75,6 @@ class TestVoiceClientService extends mock<IVoiceClientService>() {
 		this.toolResults.push({ callId, result });
 		this.toolResultResolver?.();
 	}
-
-	override sendSessionContext(): void { }
-
-	override flushSessionContext(): void { }
 
 	override requestNarration(codingSessionId: string, kind: 'response' | 'confirmation', text: string, narrationId?: string): string | undefined {
 		const id = narrationId ?? `narration-${++this.narrationCounter}`;
@@ -191,6 +190,21 @@ class TestMicCaptureService extends mock<IMicCaptureService>() {
 	}
 	override pttUp(): void { }
 	override abortPtt(): void { }
+}
+
+class CancellingMicCaptureService extends TestMicCaptureService {
+	private readonly _acquiring = new DeferredPromise<void>();
+
+	override async pttDown(turnId: string): Promise<void> {
+		this.pttTurns.push(turnId);
+		await this._acquiring.p;
+	}
+
+	override stopCapture(): void {
+		if (!this._acquiring.isSettled) {
+			this._acquiring.error(new CancellationError());
+		}
+	}
 }
 
 class TestAgentSessionsService extends mock<IAgentSessionsService>() {
@@ -553,6 +567,84 @@ suite('VoiceSessionController', () => {
 			playedAudio: ['story-start'],
 			pttTurns: 1,
 		});
+	});
+
+	test('ignores a cancelled pending microphone acquisition after disconnect', async () => {
+		const voiceClientService = new TestVoiceClientService();
+		const micCaptureService = new CancellingMicCaptureService();
+		const controller = createController(
+			voiceClientService,
+			undefined,
+			undefined,
+			undefined,
+			micCaptureService,
+		);
+		await controller.connect(mainWindow);
+		Reflect.get(controller, '_isConnected').set(true, undefined);
+
+		controller.pttDown();
+		controller.disconnect();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		assert.deepStrictEqual({
+			disconnectCalls: voiceClientService.disconnectCalls,
+			pttTurns: micCaptureService.pttTurns.length,
+			state: Reflect.get(controller, '_voiceState').get(),
+		}, {
+			disconnectCalls: 1,
+			pttTurns: 1,
+			state: 'idle',
+		});
+	});
+
+	test('explicit PTT keeps late first-chunk suppression scoped to the current turn after release', async () => {
+		const voiceClientService = new TestVoiceClientService();
+		const ttsPlaybackService = new TestTtsPlaybackService();
+		const micCaptureService = new TestMicCaptureService();
+		const controller = createController(
+			voiceClientService,
+			ttsPlaybackService,
+			new TestCommandService(),
+			NullTelemetryService,
+			micCaptureService,
+		);
+		await controller.connect(mainWindow);
+		Reflect.get(controller, '_isConnected').set(true, undefined);
+
+		voiceClientService.fireAudioResponse({
+			audio: 'story-start',
+			isFirstChunk: true,
+			isFinal: false,
+			turnId: 'story-turn',
+			responseId: 'story-response',
+		});
+		controller.pttDown();
+		const currentTurnId = micCaptureService.pttTurns[0];
+		voiceClientService.fireAudioResponse({
+			audio: 'unseen-stale-before-release',
+			isFirstChunk: true,
+			isFinal: false,
+			turnId: 'unseen-story-turn',
+			responseId: 'unseen-story-response',
+		});
+		controller.pttUp('internal');
+		voiceClientService.fireAudioResponse({
+			audio: 'unseen-stale-after-release',
+			isFirstChunk: true,
+			isFinal: false,
+			turnId: 'unseen-story-turn',
+			responseId: 'unseen-story-response',
+		});
+		voiceClientService.fireAudioResponse({
+			audio: 'current-turn-response',
+			isFirstChunk: true,
+			isFinal: false,
+			turnId: currentTurnId,
+			responseId: 'current-turn-response',
+		});
+
+		assert.deepStrictEqual(ttsPlaybackService.playedAudio, ['story-start', 'current-turn-response']);
 	});
 
 	test('manual PTT promotes passive hands-free capture without replaying stale audio', async () => {

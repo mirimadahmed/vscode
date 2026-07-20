@@ -62,6 +62,7 @@ class LiveTranscriptInserter extends Disposable {
 	private _externalEditTouchedOwnedRange = false;
 	private _lastOwnedRange: Range | undefined;
 	private _originalReadOnly = false;
+	private _managesReadOnly = false;
 	private _settledDecorations: IEditorDecorationsCollection | undefined;
 	private _shimmerDecorations: IEditorDecorationsCollection | undefined;
 	private _previousInterimText = '';
@@ -75,10 +76,16 @@ class LiveTranscriptInserter extends Disposable {
 		super();
 	}
 
-	begin(): void {
+	begin(): boolean {
 		const model = this._editor.getModel();
-		if (!model || this._decorationId) {
-			return;
+		if (!model) {
+			return false;
+		}
+		if (this._decorationId) {
+			return true;
+		}
+		if (this._editor.getOption(EditorOption.readOnly)) {
+			return false;
 		}
 		const selection = this._editor.getSelection() ?? Selection.fromPositions(model.getFullModelRange().getEndPosition());
 		const anchor = selection.getEndPosition();
@@ -99,6 +106,7 @@ class LiveTranscriptInserter extends Disposable {
 		this._lastOwnedRange = Range.fromPositions(anchor);
 		this._originalReadOnly = this._editor.getOption(EditorOption.readOnly);
 		this._editor.updateOptions({ readOnly: true });
+		this._managesReadOnly = true;
 		this._editor.focus();
 		this._modelListeners.add(model.onDidChangeContent(event => {
 			if (this._pendingOwnedChanges > 0) {
@@ -113,6 +121,7 @@ class LiveTranscriptInserter extends Disposable {
 				&& event.changes.some(change => Range.areIntersecting(change.range, this._lastOwnedRange!));
 			queueMicrotask(this._onExternalEdit);
 		}));
+		return true;
 	}
 
 	update(fullText: string): void {
@@ -238,7 +247,10 @@ class LiveTranscriptInserter extends Disposable {
 	}
 
 	private _restoreEditor(): void {
-		this._editor.updateOptions({ readOnly: this._originalReadOnly });
+		if (this._managesReadOnly) {
+			this._editor.updateOptions({ readOnly: this._originalReadOnly });
+			this._managesReadOnly = false;
+		}
 		this._editor.focus();
 		this._modelListeners.clear();
 	}
@@ -281,7 +293,7 @@ export class ChatDictationController extends Disposable implements IChatDictatio
 	}
 
 	async start(editor: ICodeEditor, window: Window & typeof globalThis): Promise<void> {
-		if (this._session || this._speechToTextService.state !== ChatSpeechToTextState.Idle) {
+		if (this._session || this._speechToTextService.state !== ChatSpeechToTextState.Idle || editor.getOption(EditorOption.readOnly)) {
 			return;
 		}
 		const disposables = new DisposableStore();
@@ -313,7 +325,10 @@ export class ChatDictationController extends Disposable implements IChatDictatio
 		disposables.add(this._speechToTextService.onDidChangeState(state => {
 			this._logService.trace(`${LOG_PREFIX} onDidChangeState ${state}`);
 			if (state === ChatSpeechToTextState.Recording) {
-				inserter.begin();
+				if (!inserter.begin()) {
+					this._endSession({ revert: true, cancelService: true });
+					return;
+				}
 				status(localize('chatDictation.recordingStarted', "Dictation recording started."));
 			} else if (state === ChatSpeechToTextState.Transcribing) {
 				inserter.beginFinalize();

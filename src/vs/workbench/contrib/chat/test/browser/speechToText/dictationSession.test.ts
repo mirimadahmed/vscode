@@ -5,6 +5,7 @@
 
 import assert from 'assert';
 import { mainWindow } from '../../../../../../base/browser/window.js';
+import { DeferredPromise } from '../../../../../../base/common/async.js';
 import { Emitter } from '../../../../../../base/common/event.js';
 import { Disposable } from '../../../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/test/common/utils.js';
@@ -31,8 +32,12 @@ class TestSpeechToTextService extends Disposable implements IChatSpeechToTextSer
 	readonly isPreparingModel = false;
 	finalText = 'final transcript';
 	startRecording = true;
+	startCount = 0;
+	startGate: DeferredPromise<void> | undefined;
 
 	async start(): Promise<void> {
+		this.startCount++;
+		await this.startGate?.p;
 		if (this.startRecording) {
 			this.setState(ChatSpeechToTextState.Recording);
 		}
@@ -151,6 +156,51 @@ suite('ChatDictationController', () => {
 			await controller.start(editor, mainWindow);
 
 			assert.strictEqual(controller.isActive, false);
+		});
+	});
+
+	test('does not start dictation in a read-only editor', async () => {
+		await withAsyncTestCodeEditor('draft', { readOnly: true }, async editor => {
+			const service = store.add(new TestSpeechToTextService());
+			const controller = store.add(new ChatDictationController(service, new NullLogService()));
+
+			await controller.start(editor, mainWindow);
+
+			assert.deepStrictEqual({
+				active: controller.isActive,
+				readOnly: editor.getOption(EditorOption.readOnly),
+				startCount: service.startCount,
+				text: editor.getModel()!.getValue(),
+			}, {
+				active: false,
+				readOnly: true,
+				startCount: 0,
+				text: 'draft',
+			});
+		});
+	});
+
+	test('does not overwrite a read-only change while startup is pending', async () => {
+		await withAsyncTestCodeEditor('draft', {}, async editor => {
+			const service = store.add(new TestSpeechToTextService());
+			service.startRecording = false;
+			service.startGate = new DeferredPromise<void>();
+			const controller = store.add(new ChatDictationController(service, new NullLogService()));
+
+			const starting = controller.start(editor, mainWindow);
+			editor.updateOptions({ readOnly: true });
+			service.startGate.complete();
+			await starting;
+
+			assert.deepStrictEqual({
+				active: controller.isActive,
+				readOnly: editor.getOption(EditorOption.readOnly),
+				text: editor.getModel()!.getValue(),
+			}, {
+				active: false,
+				readOnly: true,
+				text: 'draft',
+			});
 		});
 	});
 });

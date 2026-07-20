@@ -62,7 +62,7 @@ export class DictationAudioCapture extends Disposable implements IDictationAudio
 		this.cancel();
 		const operationId = ++this._operationId;
 		this._window = window;
-		const stream = await this._acquireStream(window);
+		const stream = await this._acquireStream(window, operationId);
 		if (operationId !== this._operationId) {
 			stream.getTracks().forEach(track => track.stop());
 			throw new Error('Dictation audio acquisition was cancelled');
@@ -166,7 +166,7 @@ export class DictationAudioCapture extends Disposable implements IDictationAudio
 		this._window = undefined;
 	}
 
-	private async _acquireStream(window: Window & typeof globalThis): Promise<MediaStream> {
+	private async _acquireStream(window: Window & typeof globalThis, operationId: number): Promise<MediaStream> {
 		const deviceId = this._storageService.get(AgentsVoiceStorageKeys.MicrophoneDevice, StorageScope.APPLICATION);
 		const constraints: MediaTrackConstraints = {
 			channelCount: 1,
@@ -185,6 +185,9 @@ export class DictationAudioCapture extends Disposable implements IDictationAudio
 				&& (error.name === 'OverconstrainedError' || error.name === 'NotFoundError');
 			if (!staleDevice) {
 				throw error;
+			}
+			if (operationId !== this._operationId) {
+				throw new Error('Dictation audio acquisition was cancelled');
 			}
 			this._logService.warn('[chat-dictation] preferred microphone is unavailable; using the system default');
 			delete constraints.deviceId;

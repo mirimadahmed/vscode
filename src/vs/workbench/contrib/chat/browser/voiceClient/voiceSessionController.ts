@@ -10,6 +10,7 @@ import { alert as ariaAlert } from '../../../../../base/browser/ui/aria/aria.js'
 import { localize } from '../../../../../nls.js';
 import { disposableTimeout } from '../../../../../base/common/async.js';
 import { CancellationTokenSource } from '../../../../../base/common/cancellation.js';
+import { isCancellationError } from '../../../../../base/common/errors.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { isEqual } from '../../../../../base/common/resources.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
@@ -265,11 +266,8 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	// --- Internal state ---
 	private _pttHeld = false;
 	/**
-	 * Whether the current held turn's `ptt_start` was passive (a hands-free
-	 * open mic: auto-listen or barge-in). A passive turn tells the backend not
-	 * to latch `user_is_speaking`; a deliberate press (non-passive) does latch.
-	 * Read by {@link _prepareForPlayback} to decide whether aborting the held
-	 * turn (which sends no `ptt_end`) is safe. Only meaningful while `_pttHeld`.
+	 * Whether the current held turn remains passive for playback preparation; it initially matches the wire flag.
+	 * Promotion clears it without resending `ptt_start` so narration does not abort a deliberate press.
 	 */
 	private _pttCurrentTurnPassive = false;
 	private _pttToggleMode = false;
@@ -2096,7 +2094,8 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	}
 
 	private _isInterruptedAudio(event: IVoiceAudioResponse): boolean {
-		return (event.turnId !== undefined && this._interruptedAudioIds.has(event.turnId))
+		return (this._suppressIncomingAudio && event.turnId !== undefined && this._pttCurrentTurnId.length > 0 && event.turnId !== this._pttCurrentTurnId)
+			|| (event.turnId !== undefined && this._interruptedAudioIds.has(event.turnId))
 			|| (event.responseId !== undefined && this._interruptedAudioIds.has(event.responseId));
 	}
 
@@ -2192,10 +2191,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		if (this._bargeInListenActive) {
 			this.logService.trace('[voice] pttDown: promoting passive barge-in listen to user interrupt');
 			this._bargeInListenActive = false;
-			// A promoted press is a deliberate interrupt, so it latches the backend
-			// like a fresh press: clear the passive flag (kept consistent with the
-			// fresh-press path below) so playback prep preserves this held press
-			// instead of tearing down the user's active speech turn for narration.
+			// Treat the promoted turn as deliberate locally so playback prep preserves the user's active speech.
 			this._pttCurrentTurnPassive = false;
 			this._autoListenSuppressed = false;
 			this._pttWaitingForPlayback = false;
@@ -2273,7 +2269,11 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		this.micCaptureService.suppressUntil(0);
 		// Lazily acquire the mic — fire-and-forget. The mic service handles
 		// the case where the user releases before acquisition completes.
-		this.micCaptureService.pttDown(this._pttCurrentTurnId, passive).catch((err) => {
+		const pttTurnId = this._pttCurrentTurnId;
+		this.micCaptureService.pttDown(pttTurnId, passive).catch((err) => {
+			if (isCancellationError(err) || this._pttCurrentTurnId !== pttTurnId) {
+				return;
+			}
 			this.logService.warn('[voice] mic acquisition failed on pttDown; disconnecting', err);
 			this._pttHeld = false;
 			this._statusText.set('Microphone denied', undefined);
@@ -2429,7 +2429,6 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		this._statusText.set('Processing...', undefined);
 		this._replyPlayedSinceSend = false;
 		this._clearAwaitingReply();
-		this._suppressIncomingAudio = false;
 		this._markTranscriptionTurnPending();
 		if (reason === 'auto' || reason === 'discard') {
 			// Backend already ended the turn, or we're discarding it — stop
@@ -2604,9 +2603,8 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		this._bargeInListenActive = true;
 		// NOTE: this marks the turn start at playback time, not when the user
 		// actually starts speaking, so voice latency/hold telemetry in
-		// hands-free mode includes playback duration. Accepted known limitation
-		// (the backend latches `user_is_speaking` on `ptt_start`); a precise
-		// measure would key off the backend's first speech/transcription signal.
+		// hands-free mode includes playback duration. A precise measure would key
+		// off the backend's first speech/transcription signal.
 		this._telemetryPttDownMs = Date.now();
 		this.micCaptureService.isMuted = false;
 		this.micCaptureService.suppressUntil(0);

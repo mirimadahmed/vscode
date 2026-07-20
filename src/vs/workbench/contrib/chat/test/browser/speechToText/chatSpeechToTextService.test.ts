@@ -12,10 +12,13 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/
 import { ConfigurationTarget, IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { TestConfigurationService } from '../../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { ILocalTranscriptionModelStatus, ILocalTranscriptionService, LocalTranscriptionModelState } from '../../../../../../platform/localTranscription/common/localTranscription.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
 import { IAudioCaptureLeaseService, AudioCaptureLeaseService } from '../../../browser/voiceClient/audioCaptureLeaseService.js';
 import { IRemoteChatSpeechToTextService, RemoteChatSpeechToTextState } from '../../../browser/speechToText/remoteChatSpeechToTextService.js';
 import { ChatSpeechToTextService, ChatSpeechToTextState, MAI_VOICE_SPEECH_TO_TEXT_MODEL, SPEECH_TO_TEXT_MODEL_SETTING } from '../../../browser/speechToText/chatSpeechToTextService.js';
+import { TestStorageService } from '../../../../../test/common/workbenchTestServices.js';
 import { workbenchInstantiationService } from '../../../../../test/browser/workbenchTestServices.js';
+import { AgentsVoiceStorageKeys } from '../../../../agentsVoice/common/agentsVoice.js';
 
 const DEFAULT_LOCAL_MODEL = 'onnx-community/nemotron-3.5-asr-streaming-0.6b-onnx-int4';
 
@@ -99,12 +102,14 @@ suite('ChatSpeechToTextService', () => {
 			'chat.speechToText.enabled': true,
 			[SPEECH_TO_TEXT_MODEL_SETTING]: model,
 		}),
+		storageService = new TestStorageService(),
 	): ChatSpeechToTextService {
 		const instantiationService = store.add(workbenchInstantiationService(undefined, store));
 		instantiationService.stub(ILocalTranscriptionService, localTranscription);
 		instantiationService.stub(IRemoteChatSpeechToTextService, remoteSpeechToText);
 		instantiationService.stub(IAudioCaptureLeaseService, new AudioCaptureLeaseService());
 		instantiationService.stub(IConfigurationService, configurationService);
+		instantiationService.stub(IStorageService, store.add(storageService));
 		return store.add(instantiationService.createInstance(ChatSpeechToTextService));
 	}
 
@@ -237,6 +242,35 @@ suite('ChatSpeechToTextService', () => {
 			state: ChatSpeechToTextState.Idle,
 			localStarts: 0,
 			stoppedTracks: 1,
+		});
+	});
+
+	test('does not request the fallback microphone after local cancellation', async () => {
+		const localTranscription = store.add(new TestLocalTranscriptionService());
+		const storageService = new TestStorageService();
+		storageService.store(AgentsVoiceStorageKeys.MicrophoneDevice, 'missing-device', StorageScope.APPLICATION, StorageTarget.MACHINE);
+		const service = createService(localTranscription, undefined, undefined, undefined, storageService);
+		const streamGate = new DeferredPromise<MediaStream>();
+		let microphoneRequests = 0;
+		const window = createWindow(() => {
+			microphoneRequests++;
+			return streamGate.p;
+		});
+
+		const starting = service.start(window);
+		assert.strictEqual(service.state, ChatSpeechToTextState.Starting);
+		service.cancel();
+		streamGate.error(new mainWindow.DOMException('Missing microphone', 'NotFoundError'));
+		await starting;
+
+		assert.deepStrictEqual({
+			state: service.state,
+			localStarts: localTranscription.startCount,
+			microphoneRequests,
+		}, {
+			state: ChatSpeechToTextState.Idle,
+			localStarts: 0,
+			microphoneRequests: 1,
 		});
 	});
 

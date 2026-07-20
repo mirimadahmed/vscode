@@ -5,6 +5,7 @@
 
 import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { addDisposableListener } from '../../../../../base/browser/dom.js';
+import { CancellationError } from '../../../../../base/common/errors.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { createDecorator } from '../../../../../platform/instantiation/common/instantiation.js';
 import { InstantiationType, registerSingleton } from '../../../../../platform/instantiation/common/extensions.js';
@@ -168,6 +169,8 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 	private _suppressUntilTs = 0;
 	private _pttAcquiring = false;
 	private _pttReleasedDuringAcquire = false;
+	private _captureGeneration = 0;
+	private _pttOperationId = 0;
 
 	// --- Hardware mute detection. ---
 	// A hardware microphone kill switch (e.g. on Framework laptops) leaves
@@ -236,6 +239,7 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 
 	async pttDown(turnId: string, passive: boolean = false): Promise<void> {
 		if (this._pttHeld) { return; }
+		const operationId = ++this._pttOperationId;
 		// If a previous press is still in its drain window, finish it
 		// now: cancel the fallback timer, mark streaming closed, fire
 		// `_onPttEnd`. Otherwise the backend would keep the prior turn
@@ -270,11 +274,16 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 		try {
 			await this.startCapture(this._window);
 		} catch (err) {
-			this._pttHeld = false;
-			this._pttStreaming = false;
-			this._pttAcquiring = false;
-			this._pttReleasedDuringAcquire = false;
+			if (operationId === this._pttOperationId) {
+				this._pttHeld = false;
+				this._pttStreaming = false;
+				this._pttAcquiring = false;
+				this._pttReleasedDuringAcquire = false;
+			}
 			throw err;
+		}
+		if (operationId !== this._pttOperationId) {
+			throw new CancellationError();
 		}
 		this._pttAcquiring = false;
 		this._onPttStart.fire(passive);
@@ -351,6 +360,7 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 	async startCapture(window: Window & typeof globalThis): Promise<void> {
 		this._window = window;
 		if (this._isCapturing) { return; }
+		const captureGeneration = ++this._captureGeneration;
 		const deviceId = this.storageService.get(AgentsVoiceStorageKeys.MicrophoneDevice, StorageScope.APPLICATION);
 		const audioConstraints: MediaTrackConstraints = {
 			channelCount: 1,
@@ -373,6 +383,9 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 			const isDeviceError = deviceId && err instanceof DOMException &&
 				(err.name === 'OverconstrainedError' || err.name === 'NotFoundError');
 			if (isDeviceError) {
+				if (captureGeneration !== this._captureGeneration) {
+					throw new CancellationError();
+				}
 				this.logService.warn(`[mic] Preferred device ${deviceId.slice(0, 8)}… unavailable, falling back to default`);
 				delete audioConstraints.deviceId;
 				try {
@@ -380,13 +393,23 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 						audio: audioConstraints,
 					});
 				} catch (retryErr) {
+					if (captureGeneration !== this._captureGeneration) {
+						throw new CancellationError();
+					}
 					this._notifyMicPermissionDenied(retryErr);
 					throw retryErr;
 				}
 			} else {
+				if (captureGeneration !== this._captureGeneration) {
+					throw new CancellationError();
+				}
 				this._notifyMicPermissionDenied(err);
 				throw err;
 			}
+		}
+		if (captureGeneration !== this._captureGeneration) {
+			micStream.getTracks().forEach(track => track.stop());
+			throw new CancellationError();
 		}
 		this._micStream = micStream;
 
@@ -504,6 +527,8 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 	}
 
 	stopCapture(): void {
+		this._captureGeneration++;
+		this._pttOperationId++;
 		// Cancel any in-flight drain; do NOT fire `_onPttEnd` here
 		// because callers (reconnect / disconnect / dispose) have
 		// already torn down or are about to tear down the backend
@@ -528,6 +553,7 @@ export class MicCaptureService extends Disposable implements IMicCaptureService 
 		this._micTrackListeners.clear();
 		this._micMutedNotified = false;
 		this._isCapturing = false;
+		this._pttAcquiring = false;
 		this._pttHeld = false;
 		this._pttStreaming = false;
 		this._pttReleasedDuringAcquire = false;

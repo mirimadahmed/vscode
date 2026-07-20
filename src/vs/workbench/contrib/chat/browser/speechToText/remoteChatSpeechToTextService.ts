@@ -157,8 +157,8 @@ export class RemoteChatSpeechToTextService extends Disposable implements IRemote
 		this._logTelemetry('start');
 
 		try {
-			const token = await this._getGitHubToken();
-			if (operationId !== this._operationId) {
+			const token = await this._getGitHubToken(operationId);
+			if (!token || operationId !== this._operationId) {
 				return;
 			}
 			const connectStartedAt = Date.now();
@@ -245,8 +245,11 @@ export class RemoteChatSpeechToTextService extends Disposable implements IRemote
 		this._cleanup();
 	}
 
-	private async _getGitHubToken(): Promise<string> {
+	private async _getGitHubToken(operationId: number): Promise<string | undefined> {
 		const sessions = await this._authenticationService.getSessions(GITHUB_PROVIDER_ID, undefined, undefined, true);
+		if (operationId !== this._operationId) {
+			return undefined;
+		}
 		const session = sessions.find(candidate => candidate.scopes.includes(GITHUB_EMAIL_SCOPE))
 			?? await this._authenticationService.createSession(GITHUB_PROVIDER_ID, [GITHUB_EMAIL_SCOPE]);
 		if (!session.accessToken) {

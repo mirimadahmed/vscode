@@ -383,7 +383,7 @@ export class ChatSpeechToTextService extends Disposable implements IChatSpeechTo
 
 		let stream: MediaStream;
 		try {
-			stream = await this._acquireStream(window);
+			stream = await this._acquireStream(window, operationId);
 		} catch (err) {
 			if (!this._isCurrentLocalStart(operationId)) {
 				return;
@@ -738,7 +738,7 @@ export class ChatSpeechToTextService extends Disposable implements IChatSpeechTo
 		return this._localOperationId === operationId && this._state === ChatSpeechToTextState.Starting;
 	}
 
-	private async _acquireStream(window: Window & typeof globalThis): Promise<MediaStream> {
+	private async _acquireStream(window: Window & typeof globalThis, operationId: number): Promise<MediaStream> {
 		// Honor the microphone chosen for Voice Mode (shared setting) so both
 		// features record from the same device. Falls back to the system default
 		// if the stored device is stale/unplugged.
@@ -759,6 +759,9 @@ export class ChatSpeechToTextService extends Disposable implements IChatSpeechTo
 				(err.name === 'OverconstrainedError' || err.name === 'NotFoundError');
 			if (!isDeviceError) {
 				throw err;
+			}
+			if (!this._isCurrentLocalStart(operationId)) {
+				throw new Error('Local dictation audio acquisition was cancelled');
 			}
 			this._logService.warn(`[chat-stt] preferred microphone ${deviceId.slice(0, 8)}… unavailable, falling back to default`);
 			delete audioConstraints.deviceId;

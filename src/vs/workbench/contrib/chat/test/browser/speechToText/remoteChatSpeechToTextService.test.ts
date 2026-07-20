@@ -129,6 +129,19 @@ class DelayedAuthenticationService extends ExistingSessionAuthenticationService 
 	}
 }
 
+class DelayedEmptyAuthenticationService extends ExistingSessionAuthenticationService {
+	private readonly _sessionGate = new DeferredPromise<void>();
+
+	override async getSessions(): Promise<readonly AuthenticationSession[]> {
+		await this._sessionGate.p;
+		return [];
+	}
+
+	resolve(): void {
+		this._sessionGate.complete();
+	}
+}
+
 suite('RemoteChatSpeechToTextService', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
@@ -251,5 +264,23 @@ suite('RemoteChatSpeechToTextService', () => {
 			connects: 1,
 		});
 		service.cancel();
+	});
+
+	test('does not open interactive authentication after a cancelled session lookup', async () => {
+		const authenticationService = new DelayedEmptyAuthenticationService();
+		const { service } = createService(authenticationService);
+		const starting = service.start(mainWindow);
+
+		service.cancel();
+		authenticationService.resolve();
+		await starting;
+
+		assert.deepStrictEqual({
+			state: service.state,
+			authCreates: authenticationService.createCount,
+		}, {
+			state: RemoteChatSpeechToTextState.Idle,
+			authCreates: 0,
+		});
 	});
 });
